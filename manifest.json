@@ -1,0 +1,9 @@
+{
+ "version": 1792789946,
+ "launcher": 1,
+ "files": {
+  "tds_macro.py": "a5e0f1905c6684436b8e093e988d2cc925aa559a86bd621fbe46ec55b6e494f1",
+  "tds_runner.py": "c53748cf4ffddbca9a34d5181b06c0c272371bd7e06bd4c18efa75faf01cb953",
+  "tds_strategy.py": "f78d54457287d9dacd8c032663fd60b2193857407d79657c4392fd46417ad29a"
+ }
+}
