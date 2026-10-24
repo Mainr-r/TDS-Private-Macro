@@ -49,33 +49,21 @@ DEFAULTS = dict(
 
 
 def app_dir(sub=""):
-    base = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
-            else os.path.dirname(os.path.abspath(__file__)))
-    for root in (base, os.path.join(os.environ.get("APPDATA", base),
-                                    "TDSStrategy")):
-        d = os.path.join(root, sub) if sub else root
-        try:
-            os.makedirs(d, exist_ok=True)
-            if os.access(d, os.W_OK):
-                return d
-        except OSError:
-            pass
-    return base
+    """User data folder - stable across app updates and reinstalls."""
+    return tm.user_dir(sub)
 
 
 def load_settings():
-    s = dict(DEFAULTS)
-    try:
-        with open(os.path.join(app_dir(), "settings.json")) as f:
-            s.update(json.load(f))
-    except Exception:
-        pass
+    tm.migrate_legacy()
+    s = dict(DEFAULTS)  # new settings added by updates get their defaults
+    saved = tm.load_json("settings.json", {})
+    if isinstance(saved, dict):
+        s.update(saved)
     return s
 
 
 def save_settings(s):
-    with open(os.path.join(app_dir(), "settings.json"), "w") as f:
-        json.dump(s, f, indent=1)
+    tm.save_json("settings.json", s)
 
 
 class Stopped(Exception):
@@ -311,7 +299,8 @@ class Runner(threading.Thread):
         return True
 
     def regions(self):
-        return self.strat.get("regions", {})
+        # boxes picked on screen (Settings) win; old strategies still work
+        return self.s.get("regions") or self.strat.get("regions", {})
 
     def read(self):
         r = self.regions()
@@ -467,6 +456,9 @@ class Runner(threading.Thread):
 
     # ---- grind loop
     def play_macro(self, path):
+        if path and not os.path.exists(path):  # moved/reinstalled? try the
+            alt = os.path.join(tm.data_dir(), os.path.basename(path))
+            path = alt if os.path.exists(alt) else path  # macros folder
         if not path or not os.path.exists(path):
             return
         try:

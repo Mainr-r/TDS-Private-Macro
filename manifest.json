@@ -1,9 +1,9 @@
 {
- "version": 1792789946,
+ "version": 1792855740,
  "launcher": 1,
  "files": {
-  "tds_macro.py": "a5e0f1905c6684436b8e093e988d2cc925aa559a86bd621fbe46ec55b6e494f1",
-  "tds_runner.py": "c53748cf4ffddbca9a34d5181b06c0c272371bd7e06bd4c18efa75faf01cb953",
-  "tds_strategy.py": "f78d54457287d9dacd8c032663fd60b2193857407d79657c4392fd46417ad29a"
+  "tds_macro.py": "dd6b461f7e8fbfc886be0b6fc17a3694060e892c6256df07f569912d6077f648",
+  "tds_runner.py": "7a6cd5d41f7e550d6a688c17c10bfdd914ddbbdc7ec06e1603326e439e00408d",
+  "tds_strategy.py": "346393ccb06c5d421ff7e444252957e6394c79d759c279cea1404b75898912da"
  }
 }

@@ -10,6 +10,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import sys
 import threading
 import time
@@ -137,19 +138,92 @@ def spin_until(target, stop_evt):
             return False
 
 
-def data_dir():
-    base = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
+def _app_base():
+    return (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
             else os.path.dirname(os.path.abspath(__file__)))
-    d = os.path.join(base, "macros")
+
+
+def user_dir(sub=""):
+    """Per-user data folder (settings, macros, strategies, drafts). It lives
+    outside the install folder and the code cache, so app updates and
+    reinstalls never touch it."""
+    roots = []
+    if os.environ.get("APPDATA"):
+        roots.append(os.path.join(os.environ["APPDATA"], "TDSStrategy"))
+    roots.append(_app_base())
+    for root in roots:
+        d = os.path.join(root, sub) if sub else root
+        try:
+            os.makedirs(d, exist_ok=True)
+            if os.access(d, os.W_OK):
+                return d
+        except OSError:
+            pass
+    return _app_base()
+
+
+def data_dir():
+    return user_dir("macros")
+
+
+def load_json(name, default):
     try:
-        os.makedirs(d, exist_ok=True)
-        if os.access(d, os.W_OK):
-            return d
-    except OSError:
+        with open(os.path.join(user_dir(), name), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def save_json(name, data):
+    """Atomic write (temp file + replace) so a crash can't corrupt it."""
+    try:
+        path = os.path.join(user_dir(), name)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=1)
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
+
+
+def _same(a, b):
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(
+        os.path.abspath(b))
+
+
+def _copy_missing(src, dst):
+    """Copy files from src to dst, never overwriting anything."""
+    if not os.path.isdir(src) or _same(src, dst):
+        return
+    os.makedirs(dst, exist_ok=True)
+    for n in os.listdir(src):
+        s_, t_ = os.path.join(src, n), os.path.join(dst, n)
+        if os.path.isfile(s_) and not os.path.exists(t_):
+            shutil.copy2(s_, t_)
+
+
+def migrate_legacy():
+    """One-time import of data saved by older versions next to the exe."""
+    root = user_dir()
+    flag = os.path.join(root, ".migrated")
+    if os.path.exists(flag):
+        return
+    try:
+        base = _app_base()
+        old, new = os.path.join(base, "settings.json"), os.path.join(
+            root, "settings.json")
+        if (os.path.isfile(old) and not os.path.exists(new)
+                and not _same(old, new)):
+            shutil.copy2(old, new)
+        for sub in ("macros", "strategies"):
+            _copy_missing(os.path.join(base, sub), os.path.join(root, sub))
+        if os.environ.get("APPDATA"):
+            _copy_missing(os.path.join(os.environ["APPDATA"], "TDSMacro",
+                                       "macros"), os.path.join(root, "macros"))
+        open(flag, "w").close()
+    except Exception:
         pass
-    d = os.path.join(os.environ.get("APPDATA", base), "TDSMacro", "macros")
-    os.makedirs(d, exist_ok=True)
-    return d
 
 
 # ---------------------------------------------------------------------- engine
@@ -369,21 +443,210 @@ ACCENT, RED, GREEN, AMBER = "#5b8cff", "#ff5b5b", "#3ddc97", "#ffb454"
 FONT, FONT_B = ("Segoe UI", 9), ("Segoe UI Semibold", 9)
 
 
+
+# ------------------------------------------------------- shared UI helpers
+def ui_scale(root):
+    """Windows display scaling (1.0 = 100%, 1.5 = 150%...)."""
+    try:
+        return max(1.0, root.winfo_fpixels("1i") / 96.0)
+    except Exception:
+        return 1.0
+
+
+_tip = {"win": None}
+
+
+def _tip_hide(*_):
+    w, _tip["win"] = _tip["win"], None
+    if w is not None:
+        try:
+            w.destroy()
+        except Exception:
+            pass
+
+
+def _tip_show(widget, text):
+    _tip_hide()
+    try:
+        sc = ui_scale(widget)
+        w = tk.Toplevel(widget)
+        w.wm_overrideredirect(True)
+        try:
+            w.attributes("-topmost", True)
+        except Exception:
+            pass
+        tk.Label(w, text=text, justify="left", wraplength=int(300 * sc),
+                 bg="#0d0f12", fg=FG, font=("Segoe UI", 9), padx=8, pady=6,
+                 bd=1, relief="solid").pack()
+        w.update_idletasks()
+        tw, th = w.winfo_reqwidth(), w.winfo_reqheight()
+        x = widget.winfo_rootx() + widget.winfo_width() + 6
+        y = widget.winfo_rooty() + widget.winfo_height() + 4
+        sw, sh = widget.winfo_screenwidth(), widget.winfo_screenheight()
+        if x + tw > sw:
+            x = max(0, sw - tw - 8)
+        if y + th > sh:
+            y = widget.winfo_rooty() - th - 4
+        w.wm_geometry(f"+{x}+{max(0, y)}")
+        _tip["win"] = w
+    except Exception:
+        pass
+
+
+def info(parent, text):
+    """Compact '!' badge: hover (or click) shows what a feature does."""
+    lbl = tk.Label(parent, text="!", bg=ACCENT, fg="white",
+                   font=("Segoe UI Semibold", 7), padx=4, pady=0,
+                   cursor="question_arrow")
+    lbl.bind("<Enter>", lambda e: _tip_show(lbl, text))
+    lbl.bind("<Leave>", _tip_hide)
+    lbl.bind("<Button-1>", lambda e: _tip_show(lbl, text))
+    lbl.bind("<Destroy>", _tip_hide, add="+")
+    return lbl
+
+
+class Flow(tk.Frame):
+    """Row of widgets that wraps onto more lines when the window is narrow,
+    so nothing is ever cut off. Add children (created with this frame as
+    parent) via add()."""
+
+    def __init__(self, parent, bg=BG, gap=4):
+        super().__init__(parent, bg=bg, height=1)
+        self.items, self.hidden, self.gap, self._w = [], set(), gap, 0
+        self.bind("<Configure>", self._on)
+
+    def add(self, w, visible=True):
+        self.items.append(w)
+        if not visible:
+            self.hidden.add(w)
+        self.after_idle(self.layout)
+
+    def set_visible(self, w, vis):
+        (self.hidden.discard if vis else self.hidden.add)(w)
+        if not vis:
+            w.place_forget()
+        self.layout()
+
+    def _on(self, e):
+        if e.width != self._w:
+            self._w = e.width
+            self.layout()
+
+    def layout(self):
+        width = self.winfo_width()
+        if width <= 1:
+            return
+        x = y = rh = 0
+        for w in self.items:
+            if w in self.hidden:
+                continue
+            ww, wh = w.winfo_reqwidth(), w.winfo_reqheight()
+            if x and x + ww > width:
+                x, y, rh = 0, y + rh + self.gap, 0
+            w.place(x=x, y=y)
+            x += ww + self.gap
+            rh = max(rh, wh)
+        if int(str(self.cget("height"))) != max(rh + y, 1):
+            self.configure(height=max(rh + y, 1))
+
+
+class Scroll(tk.Frame):
+    """Vertically scrollable panel. Put content in .body - a scrollbar
+    appears only when the window is too small to show it all."""
+
+    def __init__(self, parent, bg=BG):
+        super().__init__(parent, bg=bg)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        self.cv = tk.Canvas(self, bg=bg, highlightthickness=0,
+                            yscrollincrement=20, width=10, height=10)
+        self.sb = ttk.Scrollbar(self, orient="vertical",
+                                command=self.cv.yview)
+        self.cv.configure(yscrollcommand=self.sb.set)
+        self.cv.grid(row=0, column=0, sticky="nsew")
+        self.sb.grid(row=0, column=1, sticky="ns")
+        self.sb.grid_remove()
+        self._need = False
+        self.body = tk.Frame(self.cv, bg=bg)
+        self.win = self.cv.create_window(0, 0, window=self.body, anchor="nw")
+        self.body.bind("<Configure>", self._sync)
+        self.cv.bind("<Configure>", self._sync)
+
+    def _sync(self, _=None):
+        w, h = self.cv.winfo_width(), self.cv.winfo_height()
+        if w <= 1:
+            return
+        bh = self.body.winfo_reqheight()
+        self.cv.itemconfigure(self.win, width=w, height=max(bh, h))
+        self.cv.configure(scrollregion=(0, 0, w, max(bh, h)))
+        need = bh > h
+        if need != self._need:
+            self._need = need
+            (self.sb.grid if need else self.sb.grid_remove)()
+
+    def wheel(self, e):
+        if self._need:
+            self.cv.yview_scroll(-1 if e.delta > 0 else 1, "units")
+
+
+def enable_wheel(root):
+    """Mouse wheel scrolls whichever Scroll panel the pointer is over."""
+    def on_wheel(e):
+        w = e.widget
+        try:
+            if w.winfo_class() in ("Text", "Treeview", "Listbox",
+                                   "TCombobox"):
+                return
+        except Exception:
+            return
+        while w is not None:
+            if isinstance(w, Scroll):
+                w.wheel(e)
+                return
+            w = getattr(w, "master", None)
+    root.bind_all("<MouseWheel>", on_wheel)
+
+
+TIPS = dict(
+    macro="Type a name, press Record (or F6), do your actions in Roblox, "
+          "press F6 again - it saves under that name. Pick an existing name "
+          "from the list to load it. The folder button opens your macros.",
+    loops="How many times the recording replays. 0 = repeat forever until "
+          "you press F7 or F8.",
+    speed="Playback speed. 1.0 = as recorded, 2 = twice as fast, 0.5 = half "
+          "speed. Raise it gradually - too fast can miss clicks in game.",
+    gap="Milliseconds between a click going down and back up. Raise to "
+        "10-30 if the game ignores quick clicks.",
+    maxmin="Auto-stops playback after this many minutes. 0 = no limit.",
+    safety="Stops recording/playback if Roblox isn't the active window, so "
+           "keys and clicks never go to other apps. Recommended on.",
+    moves="Also records the cursor path. Off = clicks and keys only "
+          "(smaller, more reliable).",
+    top="Keeps this window above other windows.",
+    hotkeys="Setup: 1) name your macro  2) F6, switch to Roblox, do your "
+            "actions  3) F6 again to save  4) F7 to play.  F8 stops "
+            "everything instantly. Hotkeys work while Roblox is focused.")
+
+
 class App:
     def __init__(self):
+        migrate_legacy()
         self.q = queue.Queue()
         self.counting = False
+        self.tick = 0
+        self.saved = load_json("macro_ui.json", {})
+        self._last_saved = None
         self.root = root = tk.Tk()
         root.title("TDS Macro")
-        root.geometry("320x436")
-        root.resizable(False, False)
         root.configure(bg=BG)
+        self.sc = ui_scale(root)
         self.eng = Engine(self.q, lambda: self.name.get())
         self._dark_titlebar()
         self._build()
         self.refresh_list()
-        self.name.set("macro")
-        self.eng.load("macro")
+        self._restore()
+        self.eng.load(self.name.get())
+        root.resizable(False, False)  # size follows the content at any DPI
         self.listeners = [
             mouse.Listener(on_move=self.eng.on_move,
                            on_click=self.eng.on_click,
@@ -413,9 +676,13 @@ class App:
         b.grid(row=0, column=col, sticky="ew", padx=3)
         return b
 
-    def _field(self, parent, label, default, row, col):
-        tk.Label(parent, text=label, bg=PANEL, fg=DIM, font=FONT).grid(
-            row=row, column=col * 2, sticky="w", padx=(10, 4), pady=5)
+    def _field(self, parent, label, default, row, col, tip=""):
+        fl = tk.Frame(parent, bg=PANEL)
+        fl.grid(row=row, column=col * 2, sticky="w", padx=(10, 4), pady=5)
+        tk.Label(fl, text=label, bg=PANEL, fg=DIM, font=FONT).pack(
+            side="left")
+        if tip:
+            info(fl, tip).pack(side="left", padx=(3, 0))
         v = tk.StringVar(value=default)
         tk.Entry(parent, textvariable=v, width=6, bg=FIELD, fg=FG,
                  insertbackground=FG, relief="flat", justify="center",
@@ -423,12 +690,16 @@ class App:
                                  padx=(0, 10), ipady=3)
         return v
 
-    def _check(self, parent, text, default, cmd=None):
+    def _check(self, parent, text, default, tip="", cmd=None):
+        row = tk.Frame(parent, bg=PANEL)
+        row.pack(anchor="w", padx=8, fill="x")
         v = tk.BooleanVar(value=default)
-        tk.Checkbutton(parent, text=text, variable=v, command=cmd, bg=PANEL,
+        tk.Checkbutton(row, text=text, variable=v, command=cmd, bg=PANEL,
                        fg=FG, selectcolor=FIELD, activebackground=PANEL,
                        activeforeground=FG, font=FONT, bd=0,
-                       highlightthickness=0).pack(anchor="w", padx=8)
+                       highlightthickness=0).pack(side="left")
+        if tip:
+            info(row, tip).pack(side="left", padx=(2, 0))
         return v
 
     def _build(self):
@@ -445,7 +716,7 @@ class App:
         self.info = tk.Label(head, text="", bg=BG, fg=DIM, font=FONT)
         self.info.pack(side="right")
         self.msg = tk.Label(r, text="Ready", bg=BG, fg=DIM, font=FONT,
-                            anchor="w", wraplength=290, justify="left")
+                            anchor="w", wraplength=int(290 * self.sc), justify="left")
         self.msg.pack(fill="x", padx=14, pady=(0, 8))
 
         bf = tk.Frame(r, bg=BG)
@@ -465,8 +736,11 @@ class App:
         self.root.option_add("*TCombobox*Listbox.foreground", FG)
         mf = tk.Frame(r, bg=BG)
         mf.pack(fill="x", padx=14, pady=(12, 0))
-        tk.Label(mf, text="MACRO", bg=BG, fg=DIM,
-                 font=("Segoe UI Semibold", 8)).pack(anchor="w")
+        hl = tk.Frame(mf, bg=BG)
+        hl.pack(anchor="w")
+        tk.Label(hl, text="MACRO", bg=BG, fg=DIM,
+                 font=("Segoe UI Semibold", 8)).pack(side="left")
+        info(hl, TIPS["macro"]).pack(side="left", padx=(4, 0))
         row = tk.Frame(mf, bg=BG)
         row.pack(fill="x", pady=(2, 0))
         self.name = tk.StringVar()
@@ -480,20 +754,51 @@ class App:
 
         p = tk.Frame(r, bg=PANEL)
         p.pack(fill="x", padx=14, pady=12)
-        self.loops = self._field(p, "Loops (0=∞)", "1", 0, 0)
-        self.speed = self._field(p, "Speed ×", "1.0", 0, 1)
-        self.settle = self._field(p, "Click gap ms", "4", 1, 0)
-        self.maxmin = self._field(p, "Max min (0=off)", "0", 1, 1)
+        self.loops = self._field(p, "Loops (0=∞)", "1", 0, 0, TIPS["loops"])
+        self.speed = self._field(p, "Speed ×", "1.0", 0, 1, TIPS["speed"])
+        self.settle = self._field(p, "Click gap ms", "4", 1, 0, TIPS["gap"])
+        self.maxmin = self._field(p, "Max min (0=off)", "0", 1, 1,
+                                  TIPS["maxmin"])
         sf = tk.Frame(p, bg=PANEL)
         sf.grid(row=2, column=0, columnspan=4, sticky="w", pady=(2, 6))
-        self.safety = self._check(sf, "Auto-stop if Roblox loses focus", True)
-        self.moves = self._check(sf, "Record mouse movement", False)
-        self.top = self._check(sf, "Always on top", False,
+        self.safety = self._check(sf, "Auto-stop if Roblox loses focus", True,
+                                  TIPS["safety"])
+        self.moves = self._check(sf, "Record mouse movement", False,
+                                 TIPS["moves"])
+        self.top = self._check(sf, "Always on top", False, TIPS["top"],
                                lambda: self.root.attributes(
                                    "-topmost", self.top.get()))
 
-        tk.Label(r, text="F6 record   F7 play/stop   F8 emergency stop",
-                 bg=BG, fg=DIM, font=("Segoe UI", 8)).pack(pady=(0, 4))
+        hk = tk.Frame(r, bg=BG)
+        hk.pack(pady=(0, 6))
+        tk.Label(hk, text="F6 record   F7 play/stop   F8 emergency stop",
+                 bg=BG, fg=DIM, font=("Segoe UI", 8)).pack(side="left")
+        info(hk, TIPS["hotkeys"]).pack(side="left", padx=(4, 0))
+
+    def ui_state(self):
+        return dict(name=self.name.get(), loops=self.loops.get(),
+                    speed=self.speed.get(), settle=self.settle.get(),
+                    maxmin=self.maxmin.get(), safety=self.safety.get(),
+                    moves=self.moves.get(), top=self.top.get())
+
+    def _restore(self):
+        sv = self.saved
+        self.name.set(sv.get("name") or "macro")
+        for key in ("loops", "speed", "settle", "maxmin"):
+            if key in sv:
+                getattr(self, key).set(str(sv[key]))
+        for key in ("safety", "moves", "top"):
+            if key in sv:
+                getattr(self, key).set(bool(sv[key]))
+        if self.top.get():
+            self.root.attributes("-topmost", True)
+        self._last_saved = self.ui_state()
+
+    def save_ui(self, force=False):
+        st = self.ui_state()
+        if (force or st != self._last_saved) and save_json(
+                "macro_ui.json", st):
+            self._last_saved = st
 
     @staticmethod
     def _num(var, cast, default, lo=0):
@@ -559,6 +864,9 @@ class App:
 
     def poll(self):
         self.push_cfg()
+        self.tick += 1
+        if self.tick % 25 == 0:  # ~every 2s; only writes when changed
+            self.save_ui()
         while True:
             try:
                 kind, text = self.q.get_nowait()
@@ -582,6 +890,7 @@ class App:
         self.root.after(80, self.poll)
 
     def close(self):
+        self.save_ui(force=True)
         self.counting = False
         self.eng.stop("Closed")
         time.sleep(0.05)

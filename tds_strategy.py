@@ -3,6 +3,9 @@ TDS Strategy - visual strategy editor + auto-runner for Roblox TDS.
 
 Hotkeys (global):  F8 panic stop | F9 spam upgrade | F10 re-fire abilities | F11 start/stop run
 Needs:  pip install pynput pillow pytesseract   (+ Tesseract OCR installed for live reading)
+
+Your settings, strategies, macros and unsaved work live in
+%APPDATA%\\TDSStrategy, so app updates never touch them.
 """
 
 import ctypes
@@ -10,6 +13,8 @@ import json
 import os
 import queue
 import re
+import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -18,6 +23,7 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 from pynput import keyboard
 
+import tds_macro as tm
 import tds_runner as rn
 
 try:
@@ -29,7 +35,7 @@ BG, PANEL, FIELD = "#14161a", "#1c1f26", "#262a33"
 FG, DIM = "#e6e8ee", "#8a90a0"
 ACCENT, RED, GREEN, AMBER = "#5b8cff", "#ff5b5b", "#3ddc97", "#ffb454"
 FONT, FONT_B = ("Segoe UI", 9), ("Segoe UI Semibold", 9)
-CW, CH = 700, 394
+CW, CH = 700, 394  # default canvas size before it is measured
 REGION_COLORS = {"cash": "#ffd24d", "wave": "#4dd2ff", "result": "#ff7ad9"}
 UI_PRESETS = ["upgrade_p1", "upgrade_p2", "ability1", "ability2", "target",
               "attack_switch", "unit", "skip", "sell"]
@@ -37,6 +43,120 @@ STEP_TYPES = ["place", "upgrade", "ui", "target", "skip", "sell"]
 HINT = ("ui = ability / attack switch / unit set: Arg = UI point names, "
         "comma-separated.  target: Arg = clicks.  Repeat cd > 0 re-fires it "
         "every cd seconds (from Wave until Until).")
+
+# Text for the "!" badges: what it does + how to set it up.
+HELP = dict(
+    save="Saves this strategy (pins, UI points, boxes, steps + screenshot) "
+         "to your strategies folder. Your work is also auto-saved every few "
+         "seconds and restored next launch, even after an update.",
+    capture="Minimises this window, waits 3 s, then screenshots the Roblox "
+            "window. Switch to Roblox first and show the map with your "
+            "tower bar visible. Positions are stored as fractions, so the "
+            "strategy works at any Roblox window size.",
+    undo="Ctrl+Z also works. Undoes the last pin / UI point / box / step "
+         "change (up to 50).",
+    tools="What a click on the screenshot does.\n"
+          "Pin: a tower spot (click to add, drag to move).\n"
+          "UI point: a game button - choose its name in the box, then click "
+          "that button on the screenshot.\nRight-click deletes a pin or UI "
+          "point. (Cash/Wave/Result boxes are in Settings.)",
+    boxes="The app reads the game by OCR from three boxes. Press Select, "
+          "then drag a rectangle over that text directly on your screen "
+          "(Roblox must be visible - use windowed or borderless "
+          "fullscreen; Esc cancels). Boxes are saved with your settings "
+          "and scale with the Roblox window.\n"
+          "Cash: your money number. Wave: the wave counter. Result: where "
+          "the win/lose/disconnect text appears.",
+    ui_name="Name for the next UI point you click. upgrade_p1/p2, skip, "
+            "sell, target are used automatically by steps; ability1/2, "
+            "attack_switch, unit are used by 'ui' steps and Micro.",
+    pin="Label for the selected pin (shown in the step list).",
+    slot="Hotbar key that selects this tower before placing (e.g. 1-5). "
+         "Used by 'place' steps.",
+    type="place: put the tower on its pin.\nupgrade: upgrade it (see Path).\n"
+         "ui: click UI points (abilities, attack switch...).\n"
+         "target: cycle targeting.\nskip: press the skip-wave button.\n"
+         "sell: sell the tower.",
+    stpin="Which pin this step acts on. Not needed for 'skip'.",
+    path="Upgrade path 1 or 2. Clicks the upgrade_p1 / upgrade_p2 UI point "
+         "if set, otherwise presses the Upgrade key from Settings.",
+    wave="Step waits until the game reaches this wave. Needs OCR and the "
+         "Wave box. 0 = no wave condition.",
+    cost="Cash needed. The step waits until you have this much, then checks "
+         "that cash really dropped and retries if not. 0 = no check.",
+    delay="Extra seconds to wait once the wave/cash conditions are met.",
+    cd="Repeat every this many seconds (for abilities). 0 = run once, in "
+       "list order. Repeating steps run alongside the main list.",
+    until="Stop repeating after this wave. 0 = never.",
+    arg="ui step: UI point names, comma-separated (e.g. ability1,ability2).\n"
+        "target step: number of clicks.",
+    stepbtns="Add = append the form as a new step. Select a row, edit the "
+             "form, press Update to change it. Duplicate copies a row. "
+             "Arrows reorder - steps run top to bottom, each waiting for "
+             "its wave/cash. Delete key removes the selected row.",
+    grind="Keep going after each match: waits, plays your Restart macro, "
+          "then queues the next match. Off = a single match.",
+    maxm="Stop after this many matches. 0 = unlimited.",
+    hotkeys="F8 stop everything | F9 toggle upgrade-key spam | F10 toggle "
+            "ability re-fire (Micro box) | F11 start/stop run. They work "
+            "while Roblox is focused.",
+    testread="Reads the Wave and Cash boxes right now and logs what OCR "
+             "sees (plus the Result box text). Open Roblox first. If it "
+             "reads wrong, re-select the boxes (Settings) tighter around "
+             "the digits.",
+    testhook="Sends a test message to your Discord webhook (Settings).",
+    micro="For hand-play: abilities F10 re-clicks on a timer, written "
+          "name:seconds, e.g. ability1:30, ability2:45. Names are your UI "
+          "points. F9 spams the Upgrade key.",
+    s_webhook="Discord webhook for match results + screenshots. In Discord: "
+              "channel settings > Integrations > Webhooks > New > Copy URL. "
+              "Blank = off.",
+    s_place_id="Roblox place ID used to rejoin after a disconnect (the "
+               "number in the game's URL).",
+    s_tesseract_path="Path to tesseract.exe if OCR shows unavailable. "
+                     "Install Tesseract OCR, then Browse to it. Default "
+                     "install folders are found automatically.",
+    s_lobby_macro="Macro (from the TDS Macro recorder) played after "
+                  "rejoining, to walk into a match / pick the map.",
+    s_restart_macro="Macro played between matches to queue the next one "
+                    "(e.g. clicking Play Again).",
+    s_win_words="Comma-separated words meaning you won, matched (lowercase) "
+                "against the Result box text.",
+    s_lose_words="Comma-separated words meaning you lost, matched against "
+                 "the Result box text.",
+    s_drop_words="Words meaning you were disconnected - triggers a rejoin.",
+    s_upgrade_key="Key that upgrades a selected tower when no upgrade UI "
+                  "point is set (default E).",
+    s_sell_key="Key that sells a selected tower when no sell UI point is "
+               "set (default X).",
+    s_end_wait="Seconds to wait after a match ends before the Restart macro "
+               "runs.",
+    s_join_wait="Seconds to wait after Roblox opens before the Lobby macro "
+                "runs. Raise on slow PCs.",
+    s_start_delay="Without OCR the app can't see the match start, so it "
+                  "waits this long instead.",
+    s_match_timeout="If no wave is read within this many seconds the match "
+                    "is treated as failed and the game is rejoined.",
+    s_misc="")
+
+GUIDE = (
+    "QUICK START\n"
+    "1. Capture from Roblox (top bar) with the map and tower bar visible.\n"
+    "2. Pin tool: click each tower spot. Name it and set its Tower slot "
+    "key (hotbar number).\n"
+    "3. UI point tool: pick a name (upgrade_p1, skip, sell...) and click "
+    "that button on the screenshot.\n"
+    "4. Settings > Screen boxes: press Select for Cash, Wave and Result "
+    "and drag over that text on your screen (Roblox visible). Install "
+    "Tesseract OCR so they can be read.\n"
+    "5. Steps tab: add steps in order (place, upgrade...). Use Wave and "
+    "Cash needed so each step waits for the right moment.\n"
+    "6. Run tab: 'Test screen read' to check OCR, then Start (F11).\n\n"
+    "HOTKEYS\nF8 stop all | F9 spam upgrade | F10 re-fire abilities | "
+    "F11 start/stop run | Ctrl+Z undo\n\n"
+    "YOUR DATA\nSettings, strategies, macros and unsaved work are kept in "
+    "%APPDATA%\\TDSStrategy and survive app updates. Use 'Open data "
+    "folder' to back them up or share strategies.")
 
 
 def num(v, cast=int, default=0):
@@ -48,6 +168,7 @@ def num(v, cast=int, default=0):
 
 class App:
     def __init__(self):
+        tm.migrate_legacy()
         self.q = queue.Queue()
         self.settings = rn.load_settings()
         self.timing = rn.Timing()
@@ -56,22 +177,31 @@ class App:
         self.runner = None
         self.strat = self.blank()
         self.pil = self.tkimg = None
-        self.dw, self.dh = CW, CH
+        self.cw, self.ch = CW, CH
+        self.dw, self.dh, self.ox, self.oy = CW, CH, 0, 0
         self.sel = self.drag = None
         self._loading = False
+        self._rz = self._settings_job = None
+        self._img_dirty = False
+        self._last_draft = self._last_state = None
+        self._tess = self.settings.get("tesseract_path", "")
+        self.undo = []
+        self.state = tm.load_json("state.json", {})
         self.micro = rn.Micro(self.game, lambda: self.settings,
                               lambda: self.strat, self.log)
 
         self.root = root = tk.Tk()
+        self.sc = tm.ui_scale(root)
         root.title("TDS Strategy" + (f" · build {tds_updater.build_id()}"
                                      if tds_updater else ""))
-        root.geometry("1120x700")
-        root.minsize(1120, 700)
         root.configure(bg=BG)
+        self.setup_geometry()
         self.style()
         self.build()
         self.dark_title()
-        self.refresh_all()
+        tm.enable_wheel(root)
+        self.restore_state()
+        self.restore_draft()
         self.log("Ready. " + ("OCR available." if self.reader.ok else
                               "OCR NOT available - install Tesseract (see Settings)."))
         self.kl = keyboard.Listener(on_press=self.on_key)
@@ -80,7 +210,9 @@ class App:
         if tds_updater:
             tds_updater.start_background(lambda names: self.log(
                 "Update ready (" + ", ".join(names) + ") - restart to apply"))
+        root.bind("<Control-z>", self.do_undo)
         root.protocol("WM_DELETE_WINDOW", self.close)
+        root.after(5000, self.tick)
         self.poll()
 
     # ------------------------------------------------------------ basics
@@ -101,22 +233,43 @@ class App:
         except Exception:
             pass
 
+    def setup_geometry(self):
+        """Size the window from the screen + Windows scaling, and restore the
+        last size/position if it still fits on screen."""
+        r, sc = self.root, self.sc
+        sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
+        r.minsize(min(int(760 * sc), sw), min(int(520 * sc), sh))
+        w, h = min(int(1120 * sc), sw - 40), min(int(700 * sc), sh - 90)
+        x, y = (sw - w) // 2, max(0, (sh - h) // 3)
+        m = re.match(r"^(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$",
+                     str(self.state.get("geometry", "")))
+        if m:
+            gw, gh, gx, gy = (int(v) for v in m.groups())
+            if (gw >= 400 and gh >= 300 and gw <= sw + 20 and gh <= sh + 20
+                    and -gw + 120 < gx < sw - 120 and 0 <= gy < sh - 120):
+                w, h, x, y = gw, gh, gx, gy
+        r.geometry(f"{w}x{h}{x:+d}{y:+d}")
+
     def style(self):
         st = ttk.Style()
         st.theme_use("clam")
         st.configure("TNotebook", background=BG, borderwidth=0)
         st.configure("TNotebook.Tab", background=PANEL, foreground=DIM,
-                     padding=(14, 6), borderwidth=0)
+                     padding=(12, 6), borderwidth=0)
         st.map("TNotebook.Tab", background=[("selected", FIELD)],
                foreground=[("selected", FG)])
         st.configure("Treeview", background=FIELD, fieldbackground=FIELD,
-                     foreground=FG, borderwidth=0, rowheight=24)
+                     foreground=FG, borderwidth=0,
+                     rowheight=int(24 * self.sc))
         st.configure("Treeview.Heading", background=PANEL, foreground=DIM,
                      relief="flat")
         st.map("Treeview", background=[("selected", ACCENT)])
         st.configure("D.TCombobox", fieldbackground=FIELD, background=FIELD,
                      foreground=FG, arrowcolor=FG, bordercolor=FIELD,
                      lightcolor=FIELD, darkcolor=FIELD, padding=3)
+        st.configure("Vertical.TScrollbar", background=FIELD, troughcolor=BG,
+                     bordercolor=BG, arrowcolor=FG, lightcolor=FIELD,
+                     darkcolor=FIELD)
         self.root.option_add("*TCombobox*Listbox.background", FIELD)
         self.root.option_add("*TCombobox*Listbox.foreground", FG)
 
@@ -139,153 +292,220 @@ class App:
         return tk.Label(parent, text=text, bg=kw.pop("bg", BG),
                         fg=kw.pop("fg", DIM), font=FONT, **kw)
 
-    def build(self):
-        r = self.root
-        top = tk.Frame(r, bg=BG)
-        top.pack(fill="x", padx=10, pady=(10, 6))
-        self.name = tk.StringVar(value="strategy")
-        self.btn(top, "New", self.new, "#3a3f4b").pack(side="left")
-        self.btn(top, "Open", self.open, "#3a3f4b").pack(side="left", padx=4)
-        self.btn(top, "Save", self.save, "#2f9e6f").pack(side="left")
-        self.entry(top, self.name, 22).pack(side="left", padx=8, ipady=4)
-        self.btn(top, "Load screenshot", self.load_image, "#3a3f4b").pack(
-            side="left")
-        self.btn(top, "Capture from Roblox", self.capture, ACCENT).pack(
-            side="left", padx=4)
+    def info(self, parent, key):
+        return tm.info(parent, HELP[key])
 
-        left = tk.Frame(r, bg=BG)
-        left.pack(side="left", fill="y", padx=(10, 5))
-        tb = tk.Frame(left, bg=BG)
-        tb.pack(fill="x", pady=(0, 4))
-        self.tool = tk.StringVar(value="pin")
-        for text, val in (("Pin", "pin"), ("UI point", "ui"),
-                          ("Cash box", "cash"), ("Wave box", "wave"),
-                          ("Result box", "result")):
-            tk.Radiobutton(tb, text=text, value=val, variable=self.tool,
-                           indicatoron=0, bg=PANEL, fg=FG, selectcolor=ACCENT,
-                           activebackground=PANEL, relief="flat", bd=0,
-                           font=FONT, padx=10, pady=4).pack(side="left",
-                                                           padx=(0, 3))
-        self.ui_name = tk.StringVar(value="upgrade_p1")
-        self.combo(tb, self.ui_name, UI_PRESETS, 14).pack(side="left", padx=6)
-        self.canvas = tk.Canvas(left, width=CW, height=CH, bg="#0d0f12",
+    def wrapped(self, parent, text, **kw):
+        """Label whose text re-wraps to its width, so it never gets cut off."""
+        lbl = self.label(parent, text, justify="left", anchor="w",
+                         wraplength=int(300 * self.sc), **kw)
+        lbl.bind("<Configure>", lambda e: lbl.configure(
+            wraplength=max(60, e.width - 6)))
+        return lbl
+
+    def cell(self, flow, text, key, make, bg=BG):
+        """label + '!' + input, as one wrap-able unit inside a Flow."""
+        c = tk.Frame(flow, bg=bg)
+        self.label(c, text, bg=bg).pack(side="left")
+        self.info(c, key).pack(side="left", padx=(3, 6))
+        make(c).pack(side="left")
+        flow.add(c)
+
+    def build(self):
+        r, sc = self.root, self.sc
+        r.columnconfigure(0, weight=1)
+        r.rowconfigure(1, weight=1)
+
+        tb = self.topbar = tm.Flow(r)
+        tb.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 6))
+        self.name = tk.StringVar(value="strategy")
+        for text, cmd, col in (("New", self.new, "#3a3f4b"),
+                               ("Open", self.open, "#3a3f4b"),
+                               ("Save", self.save, "#2f9e6f")):
+            tb.add(self.btn(tb, text, cmd, col))
+        tb.add(self.entry(tb, self.name, 18))
+        tb.add(self.info(tb, "save"))
+        tb.add(self.btn(tb, "Load screenshot", self.load_image, "#3a3f4b"))
+        tb.add(self.btn(tb, "Capture from Roblox", self.capture, ACCENT))
+        tb.add(self.info(tb, "capture"))
+        tb.add(self.btn(tb, "↶ Undo", self.do_undo, "#3a3f4b"))
+        tb.add(self.info(tb, "undo"))
+        self.upd_btn = self.btn(tb, "⟳ Update ready - restart",
+                                self.restart, "#c27d12")
+        tb.add(self.upd_btn, visible=False)
+
+        body = tk.Frame(r, bg=BG)
+        body.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=3, minsize=int(360 * sc))
+        body.columnconfigure(1, weight=2, minsize=int(320 * sc))
+        left = tk.Frame(body, bg=BG)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        right = tk.Frame(body, bg=BG)
+        right.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+
+        # ---- left: tools, canvas (auto-fits), pin editor
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(1, weight=1)
+        tl = tm.Flow(left)
+        tl.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        self.tool = tk.StringVar(value=self.state.get("tool", "pin"))
+        for text, val in (("Pin", "pin"), ("UI point", "ui")):
+            tl.add(tk.Radiobutton(tl, text=text, value=val,
+                                  variable=self.tool, indicatoron=0,
+                                  bg=PANEL, fg=FG, selectcolor=ACCENT,
+                                  activebackground=PANEL, relief="flat",
+                                  bd=0, font=FONT, padx=10, pady=4))
+        tl.add(self.info(tl, "tools"))
+        self.ui_name = tk.StringVar(value=self.state.get("ui_name",
+                                                         "upgrade_p1"))
+        tl.add(self.combo(tl, self.ui_name, UI_PRESETS, 14))
+        tl.add(self.info(tl, "ui_name"))
+
+        self.canvas = tk.Canvas(left, width=10, height=10, bg="#0d0f12",
                                 highlightthickness=0, cursor="crosshair")
-        self.canvas.pack()
+        self.canvas.grid(row=1, column=0, sticky="nsew")
+        self.canvas.bind("<Configure>", self.on_canvas_resize)
         self.canvas.bind("<ButtonPress-1>", self.on_press)
         self.canvas.bind("<B1-Motion>", self.on_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
         self.canvas.bind("<Button-3>", self.on_right)
-        self.label(left, "Pin: click map to place / drag to move.  UI point: "
-                   "click the on-screen button.  Boxes: drag.  Right-click "
-                   "deletes.", wraplength=CW, justify="left").pack(
-            anchor="w", pady=(4, 6))
+        self.wrapped(left, "Pin: click map to place / drag to move.  UI "
+                     "point: click the on-screen button.  "
+                     "Right-click deletes.").grid(row=2, column=0,
+                                                  sticky="ew", pady=(4, 6))
 
-        pe = tk.Frame(left, bg=PANEL)
-        pe.pack(fill="x")
+        pe = tm.Flow(left, bg=PANEL)
+        pe.grid(row=3, column=0, sticky="ew")
         self.pin_name, self.pin_slot = tk.StringVar(), tk.StringVar()
-        self.label(pe, "Selected pin", bg=PANEL).pack(side="left", padx=8,
-                                                      pady=8)
-        self.entry(pe, self.pin_name, 18).pack(side="left", ipady=3)
-        self.label(pe, "Tower slot key", bg=PANEL).pack(side="left", padx=8)
-        self.entry(pe, self.pin_slot, 3).pack(side="left", ipady=3)
-        self.btn(pe, "Delete pin", self.delete_sel, "#c93c3c").pack(
-            side="right", padx=8)
+        pe.add(self.label(pe, " Selected pin", bg=PANEL))
+        pe.add(self.entry(pe, self.pin_name, 16))
+        pe.add(self.info(pe, "pin"))
+        pe.add(self.label(pe, "Tower slot key", bg=PANEL))
+        pe.add(self.entry(pe, self.pin_slot, 3))
+        pe.add(self.info(pe, "slot"))
+        pe.add(self.btn(pe, "Delete pin", self.delete_sel, "#c93c3c"))
         self.pin_name.trace_add("write", self.pin_edited)
         self.pin_slot.trace_add("write", self.pin_edited)
 
-        right = tk.Frame(r, bg=BG)
-        right.pack(side="left", fill="both", expand=True, padx=(5, 10))
-        nb = ttk.Notebook(right)
-        nb.pack(fill="both", expand=True)
+        # ---- right: scrollable tabs (nothing can end up hidden)
+        right.rowconfigure(0, weight=1)
+        right.columnconfigure(0, weight=1)
+        self.nb = nb = ttk.Notebook(right)
+        nb.grid(row=0, column=0, sticky="nsew")
         for title, fn in (("Steps", self.tab_steps), ("Run", self.tab_run),
-                          ("Settings", self.tab_settings)):
-            f = tk.Frame(nb, bg=BG)
-            nb.add(f, text=title)
-            fn(f)
+                          ("Settings", self.tab_settings),
+                          ("Help", self.tab_help)):
+            sp = tm.Scroll(nb)
+            nb.add(sp, text=title)
+            fn(sp.body)
 
     def tab_steps(self, f):
+        sc = self.sc
         cols = ("n", "type", "pin", "wave", "cost", "delay", "what")
         widths = (28, 60, 40, 44, 52, 44, 150)
-        self.tree = ttk.Treeview(f, columns=cols, show="headings", height=11)
+        tw = tk.Frame(f, bg=BG)
+        tw.pack(fill="x", padx=6, pady=6)
+        self.tree = ttk.Treeview(tw, columns=cols, show="headings", height=8)
+        vs = ttk.Scrollbar(tw, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vs.set)
         for c, w in zip(cols, widths):
             self.tree.heading(c, text=c.upper() if c == "n" else c.title())
-            self.tree.column(c, width=w, anchor="w")
-        self.tree.pack(fill="x", padx=6, pady=6)
+            self.tree.column(c, width=int(w * sc), minwidth=int(20 * sc),
+                             anchor="w", stretch=True)
+        self.tree.pack(side="left", fill="both", expand=True)
+        vs.pack(side="right", fill="y")
         self.tree.bind("<<TreeviewSelect>>", self.step_selected)
+        self.tree.bind("<Delete>", lambda e: self.step_remove())
 
-        g = tk.Frame(f, bg=BG)
-        g.pack(fill="x", padx=6)
         self.f = {k: tk.StringVar(value=v) for k, v in (
             ("type", "place"), ("pin", ""), ("path", "1"), ("wave", "0"),
             ("cost", "0"), ("delay", "0"), ("cd", "0"), ("until", "0"),
             ("arg", ""))}
-        self.pin_combo = self.combo(g, self.f["pin"], [], 12)
-        rows = [
-            [("Type", self.combo(g, self.f["type"], STEP_TYPES, 8)),
-             ("Pin", self.pin_combo), ("Path", self.combo(
-                 g, self.f["path"], ["1", "2"], 3))],
-            [("Wave ≥", self.entry(g, self.f["wave"], 5)),
-             ("Cash needed", self.entry(g, self.f["cost"], 7)),
-             ("Delay s", self.entry(g, self.f["delay"], 5))],
-            [("Repeat cd s", self.entry(g, self.f["cd"], 5)),
-             ("Until wave", self.entry(g, self.f["until"], 5)),
-             ("Arg", self.entry(g, self.f["arg"], 14))]]
-        for ri, row in enumerate(rows):
-            for ci, (text, w) in enumerate(row):
-                self.label(g, text).grid(row=ri, column=ci * 2, sticky="w",
-                                         padx=(0, 4), pady=3)
-                w.grid(row=ri, column=ci * 2 + 1, sticky="w", padx=(0, 10))
-        self.label(f, HINT, wraplength=420, justify="left").pack(
-            anchor="w", padx=6, pady=6)
-        bf = tk.Frame(f, bg=BG)
+        fl = tm.Flow(f)
+        fl.pack(fill="x", padx=6)
+
+        def mk_pin(c):
+            self.pin_combo = self.combo(c, self.f["pin"], [], 12)
+            return self.pin_combo
+
+        self.cell(fl, "Type", "type", lambda c: self.combo(
+            c, self.f["type"], STEP_TYPES, 8))
+        self.cell(fl, "Pin", "stpin", mk_pin)
+        self.cell(fl, "Path", "path", lambda c: self.combo(
+            c, self.f["path"], ["1", "2"], 3))
+        self.cell(fl, "Wave ≥", "wave", lambda c: self.entry(
+            c, self.f["wave"], 5))
+        self.cell(fl, "Cash needed", "cost", lambda c: self.entry(
+            c, self.f["cost"], 7))
+        self.cell(fl, "Delay s", "delay", lambda c: self.entry(
+            c, self.f["delay"], 5))
+        self.cell(fl, "Repeat cd s", "cd", lambda c: self.entry(
+            c, self.f["cd"], 5))
+        self.cell(fl, "Until wave", "until", lambda c: self.entry(
+            c, self.f["until"], 5))
+        self.cell(fl, "Arg", "arg", lambda c: self.entry(
+            c, self.f["arg"], 14))
+        self.wrapped(f, HINT).pack(fill="x", padx=6, pady=6)
+        bf = tm.Flow(f)
         bf.pack(fill="x", padx=6)
         for text, cmd, col in (("Add", self.step_add, "#2f9e6f"),
                                ("Update", self.step_update, ACCENT),
                                ("Remove", self.step_remove, "#c93c3c"),
+                               ("Duplicate", self.step_dup, "#3a3f4b"),
                                ("▲", lambda: self.step_move(-1), "#3a3f4b"),
                                ("▼", lambda: self.step_move(1), "#3a3f4b")):
-            self.btn(bf, text, cmd, col).pack(side="left", padx=(0, 4))
+            bf.add(self.btn(bf, text, cmd, col))
+        bf.add(self.info(bf, "stepbtns"))
 
     def tab_run(self, f):
-        top = tk.Frame(f, bg=BG)
+        top = tm.Flow(f)
         top.pack(fill="x", padx=8, pady=8)
-        self.btn(top, "▶ Start (F11)", self.toggle_run, "#2f9e6f").pack(
-            side="left")
-        self.btn(top, "■ Stop (F8)", self.panic, "#c93c3c").pack(
-            side="left", padx=6)
-        self.grind = tk.BooleanVar(value=True)
-        tk.Checkbutton(top, text="Grind loop", variable=self.grind, bg=BG,
-                       fg=FG, selectcolor=FIELD, activebackground=BG,
-                       activeforeground=FG, font=FONT, bd=0,
-                       highlightthickness=0).pack(side="left", padx=8)
-        self.label(top, "Max matches").pack(side="left")
-        self.maxm = tk.StringVar(value="0")
-        self.entry(top, self.maxm, 4).pack(side="left", padx=4, ipady=2)
+        top.add(self.btn(top, "▶ Start (F11)", self.toggle_run, "#2f9e6f"))
+        top.add(self.btn(top, "■ Stop (F8)", self.panic, "#c93c3c"))
+        self.grind = tk.BooleanVar(value=bool(self.state.get("grind", True)))
+        top.add(tk.Checkbutton(top, text="Grind loop", variable=self.grind,
+                               bg=BG, fg=FG, selectcolor=FIELD,
+                               activebackground=BG, activeforeground=FG,
+                               font=FONT, bd=0, highlightthickness=0))
+        top.add(self.info(top, "grind"))
+        top.add(self.label(top, "Max matches"))
+        self.maxm = tk.StringVar(value=str(self.state.get("maxm", "0")))
+        top.add(self.entry(top, self.maxm, 4))
+        top.add(self.info(top, "maxm"))
 
         self.status = tk.Label(f, text="IDLE", bg=BG, fg=FG,
                                font=("Segoe UI Semibold", 13), anchor="w")
         self.status.pack(fill="x", padx=8)
-        self.statline = self.label(f, "", anchor="w")
+        self.statline = self.wrapped(f, "")
         self.statline.pack(fill="x", padx=8)
-        self.label(f, "OCR: " + ("on" if self.reader.ok else "OFF"),
-                   anchor="w").pack(fill="x", padx=8)
-
-        mf = tk.Frame(f, bg=BG)
-        mf.pack(fill="x", padx=8, pady=8)
-        self.btn(mf, "Test screen read", self.test_read, "#3a3f4b").pack(
+        hk = tk.Frame(f, bg=BG)
+        hk.pack(fill="x", padx=8)
+        self.label(hk, "OCR: " + ("on" if self.reader.ok else "OFF")).pack(
             side="left")
-        self.btn(mf, "Test webhook", self.test_webhook, "#3a3f4b").pack(
-            side="left", padx=6)
+        self.label(hk, "   F8 stop · F9 upgrade spam · F10 abilities · "
+                   "F11 run").pack(side="left")
+        self.info(hk, "hotkeys").pack(side="left", padx=4)
 
-        self.label(f, "Micro abilities (F10)  name:cooldown, ...").pack(
-            anchor="w", padx=8)
+        mf = tm.Flow(f)
+        mf.pack(fill="x", padx=8, pady=8)
+        mf.add(self.btn(mf, "Test screen read", self.test_read, "#3a3f4b"))
+        mf.add(self.info(mf, "testread"))
+        mf.add(self.btn(mf, "Test webhook", self.test_webhook, "#3a3f4b"))
+        mf.add(self.info(mf, "testhook"))
+
+        mh = tk.Frame(f, bg=BG)
+        mh.pack(fill="x", padx=8)
+        self.label(mh, "Micro abilities (F10)  name:cooldown, ...").pack(
+            side="left")
+        self.info(mh, "micro").pack(side="left", padx=4)
         self.micro_var = tk.StringVar()
         self.micro_var.trace_add(
             "write", lambda *_: self.strat.__setitem__(
                 "micro", self.micro_var.get()))
-        self.entry(f, self.micro_var, 40).pack(fill="x", padx=8, pady=(2, 8),
-                                               ipady=3)
-        self.logbox = tk.Text(f, height=14, bg=FIELD, fg=FG, relief="flat",
+        self.entry(f, self.micro_var, 20).pack(fill="x", padx=8,
+                                               pady=(2, 8), ipady=3)
+        self.logbox = tk.Text(f, height=12, bg=FIELD, fg=FG, relief="flat",
                               font=("Consolas", 9), wrap="word", bd=0)
         self.logbox.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         self.logbox.config(state="disabled")
@@ -303,26 +523,59 @@ class App:
         ("start_delay", "Start delay, no OCR (s)", ""),
         ("match_timeout", "Match start timeout (s)", "")]
 
+    BOXES = (("cash", "Cash box"), ("wave", "Wave box"),
+             ("result", "Result box"))
+
     def tab_settings(self, f):
         self.sv = {}
+        bh = tk.Frame(f, bg=BG)
+        bh.pack(fill="x", padx=8, pady=(8, 0))
+        self.label(bh, "SCREEN BOXES", fg=FG).pack(side="left")
+        self.info(bh, "boxes").pack(side="left", padx=4)
+        bx = tk.Frame(f, bg=PANEL)
+        bx.pack(fill="x", padx=8, pady=(4, 0))
+        bx.columnconfigure(1, weight=1)
+        self.box_lbl = {}
+        for i, (kind, text) in enumerate(self.BOXES):
+            self.label(bx, text, bg=PANEL).grid(row=i, column=0, sticky="w",
+                                                padx=8, pady=4)
+            self.box_lbl[kind] = self.label(bx, "", bg=PANEL)
+            self.box_lbl[kind].grid(row=i, column=1, sticky="w")
+            self.btn(bx, "Select on screen", lambda k=kind: self.pick_box(k),
+                     ACCENT).grid(row=i, column=2, padx=4, pady=3)
+            self.btn(bx, "✕", lambda k=kind: self.clear_box(k),
+                     "#3a3f4b").grid(row=i, column=3, padx=(0, 6))
+        self.refresh_boxes()
         g = tk.Frame(f, bg=BG)
         g.pack(fill="x", padx=8, pady=8)
+        g.columnconfigure(1, weight=1)
         for i, (key, text, browse) in enumerate(self.SETTING_FIELDS):
             self.label(g, text).grid(row=i, column=0, sticky="w", pady=3)
             self.sv[key] = tk.StringVar(value=str(self.settings.get(key, "")))
-            self.entry(g, self.sv[key], 30).grid(row=i, column=1, padx=6,
+            self.entry(g, self.sv[key], 10).grid(row=i, column=1, padx=6,
                                                  ipady=3, sticky="we")
+            self.info(g, "s_" + key).grid(row=i, column=2, padx=(0, 4))
             if browse:
                 self.btn(g, "…", lambda k=key, b=browse: self.browse(k, b),
-                         "#3a3f4b").grid(row=i, column=2)
-        self.btn(g, "Save settings", self.save_settings, "#2f9e6f").grid(
-            row=len(self.SETTING_FIELDS), column=1, sticky="w", pady=10)
-        self.btn(g, "Check for updates", self.check_updates,
-                 "#3a3f4b").grid(row=len(self.SETTING_FIELDS) + 1, column=1,
-                                 sticky="w")
-        self.label(f, "Keys and OCR words depend on the game's current UI - "
-                   "verify them in-game with 'Test screen read'.",
-                   wraplength=420, justify="left").pack(anchor="w", padx=8)
+                         "#3a3f4b").grid(row=i, column=3)
+        for v in self.sv.values():  # settings save themselves
+            v.trace_add("write", self.settings_changed)
+        bf = tm.Flow(f)
+        bf.pack(fill="x", padx=8, pady=6)
+        bf.add(self.btn(bf, "Save settings", self.save_settings, "#2f9e6f"))
+        bf.add(self.btn(bf, "Check for updates", self.check_updates,
+                        "#3a3f4b"))
+        bf.add(self.btn(bf, "Open data folder",
+                        lambda: os.startfile(tm.user_dir()), "#3a3f4b"))
+        self.wrapped(f, "Settings save automatically and are kept across "
+                     "updates. Keys and OCR words depend on the game's "
+                     "current UI - verify them in-game with 'Test screen "
+                     "read'.").pack(fill="x", padx=8, pady=(0, 8))
+
+    def tab_help(self, f):
+        self.wrapped(f, GUIDE, fg=FG).pack(fill="x", padx=10, pady=10)
+        self.btn(f, "Open data folder", lambda: os.startfile(tm.user_dir()),
+                 "#3a3f4b").pack(anchor="w", padx=10)
 
     def check_updates(self):
         def work():
@@ -339,65 +592,288 @@ class App:
                 self.log("Already up to date")
         threading.Thread(target=work, daemon=True).start()
 
+    # ---- screen boxes (picked directly on the real screen)
+    def regions(self):
+        r = self.settings.get("regions")
+        if not isinstance(r, dict):
+            r = self.settings["regions"] = {}
+        return r
+
+    def refresh_boxes(self):
+        for kind, _ in self.BOXES:
+            b = self.regions().get(kind)
+            self.box_lbl[kind].config(
+                text=(f"set  ({b[0]:.0%},{b[1]:.0%}) - ({b[2]:.0%},{b[3]:.0%})"
+                      if b else "not set"),
+                fg=GREEN if b else DIM)
+
+    def clear_box(self, kind):
+        if self.regions().pop(kind, None) is not None:
+            rn.save_settings(self.settings)
+        self.refresh_boxes()
+
+    def pick_box(self, kind):
+        if not self.game.rect():
+            messagebox.showinfo("TDS Strategy", "Open Roblox first (its "
+                                "window must be visible), then try again.")
+            return
+        self.log(f"Select the {kind} box: drag over it on your screen "
+                 "(Esc cancels)")
+        self.root.iconify()
+        self.root.after(500, lambda: self._overlay(kind))
+
+    def _overlay(self, kind):
+        u = ctypes.windll.user32
+        vx, vy, vw, vh = (u.GetSystemMetrics(i) for i in (76, 77, 78, 79))
+        top = tk.Toplevel(self.root)
+        top.overrideredirect(True)
+        top.attributes("-topmost", True)
+        top.attributes("-alpha", 0.3)
+        top.configure(bg="black")
+        top.geometry(f"{vw}x{vh}{vx:+d}{vy:+d}")
+        cv = tk.Canvas(top, bg="black", highlightthickness=0,
+                       cursor="crosshair")
+        cv.pack(fill="both", expand=True)
+        col = REGION_COLORS.get(kind, FG)
+        cv.create_text(self.root.winfo_screenwidth() // 2 - vx, 50,
+                       fill="white", font=("Segoe UI Semibold", 16),
+                       text=f"Drag a box over the {kind.upper()} text   "
+                            "(Esc = cancel)")
+        st = {}
+
+        def close(rect=None):
+            top.destroy()
+            self.root.deiconify()
+            if rect:
+                self._finish_box(kind, rect)
+            else:
+                self.log("Box selection cancelled")
+
+        def press(e):
+            st["a"] = (e.x, e.y, e.x_root, e.y_root)
+
+        def drag(e):
+            if "a" in st:
+                cv.delete("r")
+                cv.create_rectangle(st["a"][0], st["a"][1], e.x, e.y,
+                                    outline=col, width=3, tags="r")
+
+        def release(e):
+            if "a" not in st:
+                return
+            x0, x1 = sorted((st["a"][2], e.x_root))
+            y0, y1 = sorted((st["a"][3], e.y_root))
+            close((x0, y0, x1, y1) if x1 - x0 > 3 and y1 - y0 > 3 else None)
+
+        cv.bind("<ButtonPress-1>", press)
+        cv.bind("<B1-Motion>", drag)
+        cv.bind("<ButtonRelease-1>", release)
+        top.bind("<Escape>", lambda e: close())
+        top.focus_force()
+
+    def _finish_box(self, kind, rect):
+        r = self.game.rect()
+        if not r:
+            self.log("Roblox window not found - box not saved")
+            return
+        w, h = r[2] - r[0], r[3] - r[1]
+        fr = [min(max((rect[0] - r[0]) / w, 0), 1),
+              min(max((rect[1] - r[1]) / h, 0), 1),
+              min(max((rect[2] - r[0]) / w, 0), 1),
+              min(max((rect[3] - r[1]) / h, 0), 1)]
+        if fr[2] - fr[0] < 0.002 or fr[3] - fr[1] < 0.002:
+            self.log("Box was outside the Roblox window - try again")
+            return
+        self.regions()[kind] = fr
+        rn.save_settings(self.settings)
+        self.refresh_boxes()
+        self.log(f"{kind} box saved - use 'Test screen read' (Run tab) to "
+                 "check it")
+
     def browse(self, key, kind):
         types = [("JSON", "*.json")] if kind == "json" else [("Program", "*.exe")]
         p = filedialog.askopenfilename(filetypes=types)
         if p:
             self.sv[key].set(p)
 
-    def save_settings(self):
+    def settings_changed(self, *_):
+        if self._settings_job:
+            self.root.after_cancel(self._settings_job)
+        self._settings_job = self.root.after(
+            800, lambda: self.save_settings(quiet=True))
+
+    def save_settings(self, quiet=False):
+        self._settings_job = None
         for k, v in self.sv.items():
             self.settings[k] = v.get().strip()
         rn.save_settings(self.settings)
-        self.reader.configure(self.settings)
-        self.log("Settings saved. OCR " + ("available" if self.reader.ok
-                                            else "not available"))
+        if not quiet or self.settings.get("tesseract_path", "") != self._tess:
+            self._tess = self.settings.get("tesseract_path", "")
+            self.reader.configure(self.settings)
+        if not quiet:
+            self.log("Settings saved. OCR " + ("available" if self.reader.ok
+                                                else "not available"))
+
+    # ----------------------------------------------------- persistence
+    def snap(self):
+        """Remember the strategy so Ctrl+Z can bring it back."""
+        self.undo.append(json.dumps(self.strat))
+        del self.undo[:-50]
+
+    def do_undo(self, _=None):
+        if not self.undo:
+            self.log("Nothing to undo")
+            return
+        self.strat = {**self.blank(), **json.loads(self.undo.pop())}
+        self.refresh_view()
+
+    def autosave(self, force=False):
+        """Keep the current work (even unsaved) so an update/restart or crash
+        never loses it."""
+        try:
+            s = json.loads(json.dumps(self.strat))
+            s["name"] = self.name.get()
+            s["image"] = "draft.png" if self.pil else ""
+            blob = json.dumps(s)
+            if self.pil and self._img_dirty:
+                self.pil.save(os.path.join(tm.user_dir(), "draft.png"))
+                self._img_dirty = False
+            if force or blob != self._last_draft:
+                if tm.save_json("draft.json", s):
+                    self._last_draft = blob
+        except Exception:
+            pass
+
+    def restore_draft(self):
+        d = tm.load_json("draft.json", None)
+        if not isinstance(d, dict):
+            return
+        self.strat = {**self.blank(), **d}
+        if self.strat.get("regions") and not self.regions():
+            self.settings["regions"] = dict(self.strat["regions"])
+            rn.save_settings(self.settings)
+            self.refresh_boxes()
+        img = os.path.join(tm.user_dir(), "draft.png")
+        if d.get("image") and os.path.exists(img):
+            try:
+                self.set_image(Image.open(img))
+                self._img_dirty = False
+            except Exception:
+                pass
+        self.refresh_all()
+        if self.strat["pins"] or self.strat["steps"]:
+            self.log("Restored your last session (including unsaved work)")
+
+    def save_state(self):
+        try:
+            st = dict(geometry=self.root.geometry(), tool=self.tool.get(),
+                      ui_name=self.ui_name.get(), grind=self.grind.get(),
+                      maxm=self.maxm.get(),
+                      tab=self.nb.index(self.nb.select()))
+        except Exception:
+            return
+        if st != self._last_state and tm.save_json("state.json", st):
+            self._last_state = st
+
+    def restore_state(self):
+        try:
+            self.nb.select(int(self.state.get("tab", 0)))
+        except Exception:
+            pass
+
+    def tick(self):
+        self.autosave()
+        self.save_state()
+        self.root.after(5000, self.tick)
+
+    def shutdown_save(self):
+        try:
+            self.save_settings(quiet=True)
+        except Exception:
+            pass
+        self.autosave(force=True)
+        self.save_state()
+
+    def restart(self):
+        if self.runner and self.runner.is_alive() and not messagebox.askyesno(
+                "TDS Strategy", "A run is in progress. Stop it and restart?"):
+            return
+        self.panic()
+        self.shutdown_save()
+        cmd = [sys.executable] + (sys.argv[1:] if getattr(sys, "frozen", False)
+                                  else sys.argv)
+        try:
+            subprocess.Popen(cmd, close_fds=True,
+                             creationflags=0x00000008 | 0x00000200)
+        except Exception as e:
+            self.log(f"Restart failed: {e}")
+            return
+        self.root.destroy()
 
     # ----------------------------------------------------------- canvas
-    def set_image(self, img):
-        self.pil = img.convert("RGB")
-        sc = min(CW / img.width, CH / img.height)
-        self.dw, self.dh = int(img.width * sc), int(img.height * sc)
-        self.tkimg = ImageTk.PhotoImage(
-            self.pil.resize((self.dw, self.dh), Image.LANCZOS))
-        self.canvas.config(width=self.dw, height=self.dh)
+    def on_canvas_resize(self, e):
+        self.cw, self.ch = max(e.width, 50), max(e.height, 50)
+        if self._rz:
+            self.root.after_cancel(self._rz)
+        self._rz = self.root.after(60, self.fit)
+
+    def fit(self):
+        """Scale the screenshot to whatever size the canvas is right now."""
+        self._rz = None
+        if self.pil:
+            k = min(self.cw / self.pil.width, self.ch / self.pil.height)
+            self.dw = max(1, int(self.pil.width * k))
+            self.dh = max(1, int(self.pil.height * k))
+            self.tkimg = ImageTk.PhotoImage(
+                self.pil.resize((self.dw, self.dh), Image.LANCZOS))
+        else:
+            self.dw, self.dh = self.cw, self.ch
+        self.ox, self.oy = (self.cw - self.dw) // 2, (self.ch - self.dh) // 2
         self.redraw()
 
+    def set_image(self, img):
+        self.pil = img.convert("RGB")
+        self._img_dirty = True
+        self.fit()
+
+    def cx(self, fx):
+        return self.ox + fx * self.dw
+
+    def cy(self, fy):
+        return self.oy + fy * self.dh
+
     def redraw(self):
-        c = self.canvas
+        c, sc = self.canvas, self.sc
         c.delete("all")
-        if not self.tkimg:
-            c.create_text(CW // 2, CH // 2, fill=DIM, font=FONT_B,
+        if not self.tkimg or not self.pil:
+            c.create_text(self.cw // 2, self.ch // 2, fill=DIM, font=FONT_B,
                           text="Load a screenshot or capture from Roblox")
             return
-        c.create_image(0, 0, anchor="nw", image=self.tkimg)
-        for k, (x1, y1, x2, y2) in self.strat["regions"].items():
-            col = REGION_COLORS.get(k, FG)
-            c.create_rectangle(x1 * self.dw, y1 * self.dh, x2 * self.dw,
-                               y2 * self.dh, outline=col, width=2)
-            c.create_text(x1 * self.dw + 3, y1 * self.dh - 8, text=k,
-                          fill=col, anchor="w", font=FONT_B)
+        c.create_image(self.ox, self.oy, anchor="nw", image=self.tkimg)
+        d = 7 * sc
         for name, (x, y) in self.strat["ui"].items():
-            px, py = x * self.dw, y * self.dh
-            c.create_polygon(px, py - 7, px + 7, py, px, py + 7, px - 7, py,
+            px, py = self.cx(x), self.cy(y)
+            c.create_polygon(px, py - d, px + d, py, px, py + d, px - d, py,
                              fill=GREEN, outline="black")
-            c.create_text(px + 10, py, text=name, fill=GREEN, anchor="w",
+            c.create_text(px + d + 3, py, text=name, fill=GREEN, anchor="w",
                           font=("Segoe UI", 8))
+        R = 10 * sc
         for p in self.strat["pins"]:
-            px, py = p["x"] * self.dw, p["y"] * self.dh
+            px, py = self.cx(p["x"]), self.cy(p["y"])
             col = AMBER if p["id"] == self.sel else ACCENT
-            c.create_oval(px - 10, py - 10, px + 10, py + 10, fill=col,
+            c.create_oval(px - R, py - R, px + R, py + R, fill=col,
                           outline="black", width=2)
             c.create_text(px, py, text=str(p["id"]), fill="white",
                           font=FONT_B)
 
     def frac(self, e):
-        return (min(max(e.x / self.dw, 0), 1), min(max(e.y / self.dh, 0), 1))
+        return (min(max((e.x - self.ox) / self.dw, 0), 1),
+                min(max((e.y - self.oy) / self.dh, 0), 1))
 
-    def nearest_pin(self, x, y, r=14):
-        best = None
+    def nearest_pin(self, x, y):
+        r, best = 14 * self.sc, None
         for p in self.strat["pins"]:
-            d = ((p["x"] * self.dw - x) ** 2 + (p["y"] * self.dh - y) ** 2) ** .5
+            d = ((self.cx(p["x"]) - x) ** 2 + (self.cy(p["y"]) - y) ** 2) ** .5
             if d <= r and (best is None or d < best[0]):
                 best = (d, p)
         return best[1] if best else None
@@ -409,6 +885,7 @@ class App:
         tool = self.tool.get()
         if tool == "pin":
             hit = self.nearest_pin(e.x, e.y)
+            self.snap()
             if hit:
                 self.select_pin(hit["id"])
                 self.drag = ("pin", hit)
@@ -422,32 +899,17 @@ class App:
         elif tool == "ui":
             name = self.ui_name.get().strip()
             if name:
+                self.snap()
                 self.strat["ui"][name] = [fx, fy]
-        else:
-            self.drag = ("region", tool, fx, fy)
         self.redraw()
 
     def on_drag(self, e):
-        if not self.drag:
-            return
-        fx, fy = self.frac(e)
-        if self.drag[0] == "pin":
+        if self.drag and self.drag[0] == "pin":
+            fx, fy = self.frac(e)
             self.drag[1]["x"], self.drag[1]["y"] = fx, fy
             self.redraw()
-        else:
-            self.canvas.delete("tmp")
-            self.canvas.create_rectangle(
-                self.drag[2] * self.dw, self.drag[3] * self.dh, e.x, e.y,
-                outline=REGION_COLORS[self.drag[1]], dash=(4, 3), tags="tmp")
 
     def on_release(self, e):
-        if self.drag and self.drag[0] == "region":
-            fx, fy = self.frac(e)
-            x0, y0 = self.drag[2], self.drag[3]
-            if abs(fx - x0) > 0.005 and abs(fy - y0) > 0.005:
-                self.strat["regions"][self.drag[1]] = [
-                    min(x0, fx), min(y0, fy), max(x0, fx), max(y0, fy)]
-            self.redraw()
         self.drag = None
 
     def on_right(self, e):
@@ -455,8 +917,10 @@ class App:
         if hit:
             self.delete_pin(hit["id"])
             return
+        r = 14 * self.sc
         for name, (x, y) in list(self.strat["ui"].items()):
-            if abs(x * self.dw - e.x) < 14 and abs(y * self.dh - e.y) < 14:
+            if abs(self.cx(x) - e.x) < r and abs(self.cy(y) - e.y) < r:
+                self.snap()
                 del self.strat["ui"][name]
                 self.redraw()
                 return
@@ -484,6 +948,7 @@ class App:
             self.delete_pin(self.sel)
 
     def delete_pin(self, pid):
+        self.snap()
         self.strat["pins"] = [p for p in self.strat["pins"] if p["id"] != pid]
         self.strat["steps"] = [s for s in self.strat["steps"]
                                if s.get("pin") != pid]
@@ -549,20 +1014,32 @@ class App:
         if s["type"] != "skip" and s["pin"] is None:
             messagebox.showinfo("TDS Strategy", "Pick a pin for this step.")
             return
+        self.snap()
         self.strat["steps"].append(s)
         self.refresh_steps()
 
     def step_update(self):
         sel = self.tree.selection()
         if sel:
+            self.snap()
             self.strat["steps"][int(sel[0])] = self.form_step()
             self.refresh_steps()
 
     def step_remove(self):
         sel = self.tree.selection()
         if sel:
+            self.snap()
             del self.strat["steps"][int(sel[0])]
             self.refresh_steps()
+
+    def step_dup(self):
+        sel = self.tree.selection()
+        if sel:
+            self.snap()
+            i = int(sel[0])
+            self.strat["steps"].insert(i + 1, dict(self.strat["steps"][i]))
+            self.refresh_steps()
+            self.tree.selection_set(str(i + 1))
 
     def step_move(self, d):
         sel = self.tree.selection()
@@ -571,6 +1048,7 @@ class App:
         i, j = int(sel[0]), int(sel[0]) + d
         st = self.strat["steps"]
         if 0 <= j < len(st):
+            self.snap()
             st[i], st[j] = st[j], st[i]
             self.refresh_steps()
             self.tree.selection_set(str(j))
@@ -578,17 +1056,26 @@ class App:
     # ---------------------------------------------------------- file ops
     def refresh_all(self):
         self.name.set(self.strat.get("name", "strategy"))
+        self.refresh_view()
+
+    def refresh_view(self):
         self.micro_var.set(self.strat.get("micro", ""))
         self.select_pin(0)
         self.refresh_pins()
         self.redraw()
 
     def new(self):
+        if (self.strat["pins"] or self.strat["steps"]) and not \
+                messagebox.askyesno("TDS Strategy", "Start a new strategy? "
+                                    "Anything you haven't saved is lost."):
+            return
         self.strat = self.blank()
         self.pil = self.tkimg = None
-        self.dw, self.dh = CW, CH
-        self.canvas.config(width=CW, height=CH)
+        self._img_dirty = False
+        self.undo.clear()
+        self.fit()
         self.refresh_all()
+        self.autosave(force=True)
 
     def save(self):
         name = re.sub(r"[^\w \-]", "", self.name.get()).strip() or "strategy"
@@ -614,9 +1101,12 @@ class App:
             return
         self.strat = {**self.blank(), **s}
         self.pil = self.tkimg = None
+        self.undo.clear()
         img = os.path.join(os.path.dirname(p), self.strat.get("image", ""))
         if self.strat.get("image") and os.path.exists(img):
             self.set_image(Image.open(img))
+        else:
+            self.fit()
         self.refresh_all()
 
     def load_image(self):
@@ -643,7 +1133,7 @@ class App:
         if self.runner and self.runner.is_alive():
             self.runner.stop()
             return
-        self.save_settings()
+        self.save_settings(quiet=True)
         if not self.strat["pins"] or not self.strat["steps"]:
             messagebox.showinfo("TDS Strategy", "Add pins and steps first.")
             return
@@ -670,7 +1160,7 @@ class App:
             if not self.reader.ok:
                 self.log("OCR unavailable - install Tesseract, set its path")
                 return
-            r = self.strat["regions"]
+            r = self.regions()
             self.log(f"Read: wave={self.reader.number(r.get('wave'), True)}  "
                      f"cash={self.reader.number(r.get('cash'))}")
             if r.get("result"):
@@ -679,7 +1169,7 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def test_webhook(self):
-        self.save_settings()
+        self.save_settings(quiet=True)
         url = self.settings.get("webhook", "")
         if not url:
             self.log("Set a webhook URL in Settings first")
@@ -712,6 +1202,7 @@ class App:
                 self.logbox.config(state="disabled")
                 if text.startswith("Update ready"):
                     self.root.title("TDS Strategy - update ready, restart to apply")
+                    self.topbar.set_visible(self.upd_btn, True)
             elif text == "panic":
                 self.panic()
             elif text in ("spam", "abil"):
@@ -732,6 +1223,7 @@ class App:
 
     def close(self):
         self.panic()
+        self.shutdown_save()
         self.root.destroy()
 
     def run(self):
