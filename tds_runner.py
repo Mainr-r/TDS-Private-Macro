@@ -20,7 +20,7 @@ import urllib.request
 import uuid
 from ctypes import wintypes
 
-from PIL import Image, ImageGrab, ImageOps
+from PIL import Image, ImageFilter, ImageGrab, ImageOps
 
 import tds_macro as tm
 
@@ -45,7 +45,8 @@ DEFAULTS = dict(
     win_words="triumph,victory", lose_words="game over,defeat",
     drop_words="disconnected,error code,reconnect",
     upgrade_key="e", sell_key="x",
-    end_wait=8, join_wait=20, start_delay=5, match_timeout=240)
+    end_wait=8, join_wait=20, start_delay=5, match_timeout=240,
+    step_gap=1.0)
 
 
 def app_dir(sub=""):
@@ -194,29 +195,107 @@ class Reader:
         except Exception:
             self.ok = False
 
+    last_conf, last_votes = 0.0, 0
+    MIN_CONF, MIN_SOLO = 10.0, 40.0  # confidence floors (0-100)
+
     @staticmethod
-    def _prep(img, invert):
+    def _otsu(g):
+        """Best black/white split point for a grayscale image."""
+        h = g.histogram()
+        total = sum(h)
+        sum_all = sum(i * n for i, n in enumerate(h))
+        w0 = s0 = 0
+        best, thr = -1.0, 128
+        for i in range(256):
+            w0 += h[i]
+            if not w0:
+                continue
+            w1 = total - w0
+            if not w1:
+                break
+            s0 += i * h[i]
+            m0, m1 = s0 / w0, (sum_all - s0) / w1
+            var = w0 * w1 * (m0 - m1) ** 2
+            if var > best:
+                best, thr = var, i
+        return thr
+
+    @staticmethod
+    def _bin(g, thr, flip=False):
+        """Black text on a white background, padded (Tesseract misreads
+        digits that touch the image edge)."""
+        b = g.point(lambda v: 255 if v > thr else 0)
+        white = b.histogram()[255]
+        if (white < b.width * b.height / 2) != flip:
+            b = ImageOps.invert(b)
+        pad = max(12, int(max(b.size) * 0.12))
+        return ImageOps.expand(b, border=pad, fill=255)
+
+    def _variants(self, img):
+        """Different clean-ups of the same picture, best first."""
         g = ImageOps.autocontrast(ImageOps.grayscale(img))
-        g = g.resize((g.width * 3, g.height * 3), Image.LANCZOS)
-        if invert:
-            g = ImageOps.invert(g)
-        return g.point(lambda v: 255 if v > 140 else 0)
+        g = g.resize((max(1, g.width * 3), max(1, g.height * 3)),
+                     Image.LANCZOS)
+        g = g.filter(ImageFilter.MedianFilter(5))  # drop speckle noise
+        t = self._otsu(g)
+        yield self._bin(g, t)
+        yield self._bin(g, 140)
+        yield self._bin(g, max(40, t - 35))
+        yield self._bin(g, t, flip=True)
+
+    @staticmethod
+    def _ocr(img, wl):
+        """(digits, confidence 0-100) for a one-line picture."""
+        d = pytesseract.image_to_data(
+            img, output_type=pytesseract.Output.DICT,
+            config=f"--psm 7 -c tessedit_char_whitelist={wl}")
+        txt, confs = "", []
+        for t, c in zip(d["text"], d["conf"]):
+            t = str(t).strip()
+            if t:
+                txt += t
+                try:
+                    confs.append(max(float(c), 0.0))
+                except ValueError:
+                    pass
+        return txt, (sum(confs) / len(confs) if confs else 0.0)
 
     def number(self, region, first=False):
+        """Reads a number. The same picture is cleaned up several ways and
+        the readings vote; low-confidence or impossible readings return
+        None instead of a wrong number."""
+        self.last_conf = 0.0
         if not self.ok or not region:
             return None
         img = self.g.grab(region)
         if img is None:
             return None
         wl = "0123456789/" if first else "0123456789"
-        t0, txt = time.perf_counter(), ""
-        for inv in (False, True):
-            txt = pytesseract.image_to_string(
-                self._prep(img, inv),
-                config=f"--psm 7 -c tessedit_char_whitelist={wl}").strip()
-            if re.search(r"\d", txt):
+        t0 = time.perf_counter()
+        votes = {}  # text -> [count, summed confidence]
+        for v in self._variants(img):
+            txt, conf = self._ocr(v, wl)
+            if not re.search(r"\d", txt):
+                continue
+            e = votes.setdefault(txt, [0, 0.0])
+            e[0] += 1
+            e[1] += conf
+            if e[0] >= 2:  # two clean-ups agree - good enough
                 break
         self.t.note_read(time.perf_counter() - t0)
+        if not votes:
+            return None
+        txt, (n, tot) = max(votes.items(),
+                            key=lambda kv: (kv[1][0], kv[1][1]))
+        conf = tot / n
+        self.last_conf, self.last_votes = conf, n
+        if conf < self.MIN_CONF or (n == 1 and conf < self.MIN_SOLO):
+            return None  # unsure = not trusted
+        if first:  # "23/50" -> 23, and 23 can never exceed 50
+            m = re.match(r"(\d+)/(\d+)", txt)
+            if m:
+                cur, total = int(m.group(1)), int(m.group(2))
+                return cur if cur <= total else None
         m = re.search(r"\d+", txt)
         return int(m.group()) if m else None
 
@@ -273,6 +352,7 @@ class Runner(threading.Thread):
         self.state, self.wave, self.peak, self.cash = "idle", 0, 0, None
         self.last_end = 0.0
         self.pins = {p["id"]: p for p in strat.get("pins", [])}
+        self._cand = {}
 
     # ---- helpers
     def sleep(self, secs):
@@ -302,16 +382,57 @@ class Runner(threading.Thread):
         # boxes picked on screen (Settings) win; old strategies still work
         return self.s.get("regions") or self.strat.get("regions", {})
 
-    def read(self):
-        r = self.regions()
-        w = self.reader.number(r.get("wave"), first=True)
-        c = self.reader.number(r.get("cash"))
-        if w is not None and w <= self.wave + 3:
-            self.low = self.low + 1 if w + 3 <= self.peak else 0
-            self.wave = w
-            self.peak = max(self.peak, w)
-        if c is not None:
+    def _confirm(self, key, val, need):
+        """True once the same new value has been read `need` times in a row."""
+        c = self._cand.get(key)
+        if c and c[0] == val:
+            c[1] += 1
+        else:
+            c = self._cand[key] = [val, 1]
+        return c[1] >= need
+
+    def _feed_wave(self, w):
+        """The wave only ever counts up, so a single odd reading (23 -> 7)
+        is ignored. A new value must repeat before it is believed: twice
+        for the next few waves, four times for a drop or a big jump."""
+        if w is None:
+            return
+        if w == self.wave:
+            self._cand.pop("wave", None)
+            return
+        need = 2 if self.wave < w <= self.wave + 3 else 4
+        if not self._confirm("wave", w, need):
+            return
+        self._cand.pop("wave", None)
+        if w < self.wave and w + 3 <= self.peak:
+            self.low = 3  # a confirmed drop = the match was reset
+        self.wave = w
+        self.peak = max(self.peak, w)
+
+    def _feed_cash(self, c):
+        """Cash goes up and down, so a new value just has to repeat (three
+        times if it suddenly jumps to over 2.5x). If it keeps changing, take
+        it after a few reads anyway."""
+        if c is None:
+            return
+        cur = self.cash
+        if c == cur:
+            self._cand.pop("cash", None)
+            self._cand["cash_n"] = 0
+            return
+        jump = cur is not None and cur > 0 and c > cur * 2.5
+        n = self._cand["cash_n"] = self._cand.get("cash_n", 0) + 1
+        if self._confirm("cash", c, 3 if jump else 2) or (n >= 5
+                                                          and not jump):
             self.cash = c
+            self._cand.pop("cash", None)
+            self._cand["cash_n"] = 0
+
+    def read(self, wave=True):
+        r = self.regions()
+        if wave:
+            self._feed_wave(self.reader.number(r.get("wave"), first=True))
+        self._feed_cash(self.reader.number(r.get("cash")))
 
     def kw(self, key):
         return [w.strip().lower() for w in self.s.get(key, "").split(",")
@@ -336,8 +457,12 @@ class Runner(threading.Thread):
                 or not self.regions().get("cash")):
             return True
         self.sleep(self.timing.d(0.25))
-        self.read()
-        return self.cash is not None and self.cash <= before - cost * 0.5
+        for _ in range(4):  # readings must settle before we judge
+            self.read(wave=False)
+            if self.cash is not None and self.cash <= before - cost * 0.5:
+                return True
+            self.sleep(0.1)
+        return False
 
     def select(self, pin):
         self.click((pin["x"], pin["y"]))
@@ -420,9 +545,15 @@ class Runner(threading.Thread):
         seq = [s for s in steps if not float(s.get("cd", 0) or 0)]
         rep = [s for s in steps if float(s.get("cd", 0) or 0)]
         nxt = {id(s): 0.0 for s in rep}
-        i, gate, self.low = 0, None, 0
+        i, self.low = 0, 0
         self.wave = self.peak = 0
         self.cash = None
+        self._cand = {}
+        try:
+            gap = max(float(self.s.get("step_gap", 1.0) or 0), 0.0)
+        except (TypeError, ValueError):
+            gap = 1.0
+        last = time.time()  # when the previous step was done
         self.state = "playing"
         if not self.reader.ok:
             self.log("No OCR: running by delays only; stop it manually")
@@ -437,14 +568,14 @@ class Runner(threading.Thread):
             now = time.time()
             if i < len(seq):
                 s = seq[i]
-                if self.gate_ok(s):
-                    gate = gate or now
-                    if now - gate >= float(s.get("delay", 0) or 0):
-                        self.exec(s)
-                        i, gate = i + 1, None
-                        continue
-                else:
-                    gate = None
+                # wait after the previous step: this step's own Delay if it
+                # has one, otherwise the global "delay between steps"
+                wait = float(s.get("delay", 0) or 0) or gap
+                if self.gate_ok(s) and now - last >= wait:
+                    self.exec(s)
+                    last = time.time()
+                    i += 1
+                    continue
             for s in rep:
                 until = int(s.get("until", 0) or 0)
                 if (self.wave >= int(s.get("wave", 0) or 0)
@@ -500,6 +631,7 @@ class Runner(threading.Thread):
     def wait_match(self):
         self.state = "waiting"
         self.wave, self.peak, self.cash, self.low = 0, 0, None, 0
+        self._cand = {}
         if not self.reader.ok or not self.regions().get("wave"):
             self.sleep(float(self.s.get("start_delay", 5)))
             return True

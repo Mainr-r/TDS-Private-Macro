@@ -512,7 +512,7 @@ class Flow(tk.Frame):
 
     def __init__(self, parent, bg=BG, gap=4):
         super().__init__(parent, bg=bg, height=1)
-        self.items, self.hidden, self.gap, self._w = [], set(), gap, 0
+        self.items, self.hidden, self.gap, self._fw = [], set(), gap, 0
         self.bind("<Configure>", self._on)
 
     def add(self, w, visible=True):
@@ -528,8 +528,8 @@ class Flow(tk.Frame):
         self.layout()
 
     def _on(self, e):
-        if e.width != self._w:
-            self._w = e.width
+        if e.width != self._fw:
+            self._fw = e.width
             self.layout()
 
     def layout(self):

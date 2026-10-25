@@ -84,7 +84,19 @@ HELP = dict(
          "Wave box. 0 = no wave condition.",
     cost="Cash needed. The step waits until you have this much, then checks "
          "that cash really dropped and retries if not. 0 = no check.",
-    delay="Extra seconds to wait once the wave/cash conditions are met.",
+    delay="This step's own wait: seconds after the PREVIOUS step finished "
+          "before this one runs. 0 = use 'Delay between steps' (below the "
+          "step buttons). Wave / Cash needed must also be met.",
+    step_gap="Seconds to wait after one step finishes before the next one "
+             "runs (default 1). With 1, every step goes 1 s after the last "
+             "one. A step with its own Delay uses that instead. 0 = no wait. "
+             "Wave / Cash needed still have to be met.",
+    zoom="Zoom the screenshot to place pins and UI points precisely.\n"
+         "Mouse wheel = zoom toward the cursor.\n"
+         "Pan = hold the middle mouse button and drag, or hold Ctrl and drag "
+         "with the left button.\n"
+         "Fit (or double middle-click) resets the view. Zoom only changes "
+         "how you view it - saved positions are exact at any zoom.",
     cd="Repeat every this many seconds (for abilities). 0 = run once, in "
        "list order. Repeating steps run alongside the main list.",
     until="Stop repeating after this wave. 0 = never.",
@@ -179,6 +191,7 @@ class App:
         self.pil = self.tkimg = None
         self.cw, self.ch = CW, CH
         self.dw, self.dh, self.ox, self.oy = CW, CH, 0, 0
+        self.zoom, self.img_xy, self.panning = 1.0, (0, 0), None
         self.sel = self.drag = None
         self._loading = False
         self._rz = self._settings_job = None
@@ -357,6 +370,11 @@ class App:
                                   activebackground=PANEL, relief="flat",
                                   bd=0, font=FONT, padx=10, pady=4))
         tl.add(self.info(tl, "tools"))
+        tl.add(self.btn(tl, "＋", lambda: self.zoom_by(1.5), "#3a3f4b"))
+        tl.add(self.btn(tl, "－", lambda: self.zoom_by(1 / 1.5), "#3a3f4b"))
+        self.fit_btn = self.btn(tl, "Fit", self.zoom_reset, "#3a3f4b")
+        tl.add(self.fit_btn)
+        tl.add(self.info(tl, "zoom"))
         self.ui_name = tk.StringVar(value=self.state.get("ui_name",
                                                          "upgrade_p1"))
         tl.add(self.combo(tl, self.ui_name, UI_PRESETS, 14))
@@ -370,9 +388,15 @@ class App:
         self.canvas.bind("<B1-Motion>", self.on_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
         self.canvas.bind("<Button-3>", self.on_right)
+        self.canvas.bind("<MouseWheel>", self.on_wheel)
+        self.canvas.bind("<ButtonPress-2>", self.pan_start)
+        self.canvas.bind("<B2-Motion>", self.pan_move)
+        self.canvas.bind("<ButtonRelease-2>", self.pan_end)
+        self.canvas.bind("<Double-Button-2>", lambda e: self.zoom_reset())
         self.wrapped(left, "Pin: click map to place / drag to move.  UI "
                      "point: click the on-screen button.  "
-                     "Right-click deletes.").grid(row=2, column=0,
+                     "Right-click deletes.  Wheel = zoom, "
+                     "middle-drag / Ctrl+drag = pan.").grid(row=2, column=0,
                                                   sticky="ew", pady=(4, 6))
 
         pe = tm.Flow(left, bg=PANEL)
@@ -458,6 +482,14 @@ class App:
             bf.add(self.btn(bf, text, cmd, col))
         bf.add(self.info(bf, "stepbtns"))
 
+        self.sv = getattr(self, "sv", {})
+        self.sv["step_gap"] = tk.StringVar(
+            value=str(self.settings.get("step_gap", 1.0)))
+        gf = tm.Flow(f)
+        gf.pack(fill="x", padx=6, pady=(10, 0))
+        self.cell(gf, "Delay between steps (s)", "step_gap",
+                  lambda c: self.entry(c, self.sv["step_gap"], 5))
+
     def tab_run(self, f):
         top = tm.Flow(f)
         top.pack(fill="x", padx=8, pady=8)
@@ -527,7 +559,7 @@ class App:
              ("result", "Result box"))
 
     def tab_settings(self, f):
-        self.sv = {}
+        self.sv = getattr(self, "sv", {})
         bh = tk.Frame(f, bg=BG)
         bh.pack(fill="x", padx=8, pady=(8, 0))
         self.label(bh, "SCREEN BOXES", fg=FG).pack(side="left")
@@ -818,22 +850,96 @@ class App:
         self._rz = self.root.after(60, self.fit)
 
     def fit(self):
-        """Scale the screenshot to whatever size the canvas is right now."""
+        """Lay the screenshot out for the current canvas size and zoom."""
         self._rz = None
-        if self.pil:
-            k = min(self.cw / self.pil.width, self.ch / self.pil.height)
-            self.dw = max(1, int(self.pil.width * k))
-            self.dh = max(1, int(self.pil.height * k))
-            self.tkimg = ImageTk.PhotoImage(
-                self.pil.resize((self.dw, self.dh), Image.LANCZOS))
-        else:
-            self.dw, self.dh = self.cw, self.ch
-        self.ox, self.oy = (self.cw - self.dw) // 2, (self.ch - self.dh) // 2
+        if not self.pil:
+            self.dw, self.dh, self.ox, self.oy = self.cw, self.ch, 0, 0
+            self.tkimg = None
+            self.redraw()
+            return
+        base = min(self.cw / self.pil.width, self.ch / self.pil.height)
+        k = base * self.zoom
+        self.dw = max(1.0, self.pil.width * k)
+        self.dh = max(1.0, self.pil.height * k)
+        self.clamp_view()
+        self.render()
+
+    def clamp_view(self):
+        """Keep the image centred when it fits, else inside the canvas."""
+        for size, view, attr in ((self.dw, self.cw, "ox"),
+                                 (self.dh, self.ch, "oy")):
+            cur = getattr(self, attr)
+            setattr(self, attr, (view - size) / 2 if size <= view
+                    else min(0.0, max(view - size, cur)))
+
+    def render(self):
+        """Draw only the visible part of the screenshot (fast at any zoom)."""
+        W, H = self.pil.size
+        k = self.dw / W
+        x0 = max(0, int(-self.ox / k))
+        y0 = max(0, int(-self.oy / k))
+        x1 = min(W, int((self.cw - self.ox) / k) + 2)
+        y1 = min(H, int((self.ch - self.oy) / k) + 2)
+        if x1 <= x0 or y1 <= y0:
+            self.tkimg = None
+            self.redraw()
+            return
+        size = (max(1, round((x1 - x0) * k)), max(1, round((y1 - y0) * k)))
+        quality = Image.LANCZOS if self.zoom <= 1.01 else Image.BILINEAR
+        self.tkimg = ImageTk.PhotoImage(
+            self.pil.crop((x0, y0, x1, y1)).resize(size, quality))
+        self.img_xy = (self.ox + x0 * k, self.oy + y0 * k)
+        self.fit_btn.config(text="Fit" if self.zoom <= 1.01
+                            else f"Fit ({self.zoom * 100:.0f}%)")
         self.redraw()
+
+    def zoom_at(self, factor, px, py):
+        """Zoom by `factor`, keeping the point under (px, py) in place."""
+        if not self.pil:
+            return
+        new = min(max(self.zoom * factor, 1.0), 16.0)
+        if abs(new - self.zoom) < 1e-9:
+            return
+        fx = (px - self.ox) / self.dw
+        fy = (py - self.oy) / self.dh
+        self.zoom = new
+        base = min(self.cw / self.pil.width, self.ch / self.pil.height)
+        self.dw = self.pil.width * base * new
+        self.dh = self.pil.height * base * new
+        self.ox, self.oy = px - fx * self.dw, py - fy * self.dh
+        self.clamp_view()
+        self.render()
+
+    def zoom_by(self, factor):
+        self.zoom_at(factor, self.cw / 2, self.ch / 2)
+
+    def zoom_reset(self):
+        self.zoom = 1.0
+        self.fit()
+
+    def on_wheel(self, e):
+        self.zoom_at(1.25 if e.delta > 0 else 1 / 1.25, e.x, e.y)
+
+    def pan_start(self, e):
+        if self.pil:
+            self.panning = (e.x, e.y, self.ox, self.oy)
+            self.canvas.config(cursor="fleur")
+
+    def pan_move(self, e):
+        if self.panning and self.pil:
+            x, y, ox, oy = self.panning
+            self.ox, self.oy = ox + e.x - x, oy + e.y - y
+            self.clamp_view()
+            self.render()
+
+    def pan_end(self, e=None):
+        self.panning = None
+        self.canvas.config(cursor="crosshair")
 
     def set_image(self, img):
         self.pil = img.convert("RGB")
         self._img_dirty = True
+        self.zoom = 1.0
         self.fit()
 
     def cx(self, fx):
@@ -849,7 +955,7 @@ class App:
             c.create_text(self.cw // 2, self.ch // 2, fill=DIM, font=FONT_B,
                           text="Load a screenshot or capture from Roblox")
             return
-        c.create_image(self.ox, self.oy, anchor="nw", image=self.tkimg)
+        c.create_image(*self.img_xy, anchor="nw", image=self.tkimg)
         d = 7 * sc
         for name, (x, y) in self.strat["ui"].items():
             px, py = self.cx(x), self.cy(y)
@@ -881,6 +987,9 @@ class App:
     def on_press(self, e):
         if not self.pil:
             return
+        if e.state & 0x4:  # Ctrl + drag = pan
+            self.pan_start(e)
+            return
         fx, fy = self.frac(e)
         tool = self.tool.get()
         if tool == "pin":
@@ -904,6 +1013,9 @@ class App:
         self.redraw()
 
     def on_drag(self, e):
+        if self.panning:
+            self.pan_move(e)
+            return
         if self.drag and self.drag[0] == "pin":
             fx, fy = self.frac(e)
             self.drag[1]["x"], self.drag[1]["y"] = fx, fy
@@ -911,6 +1023,8 @@ class App:
 
     def on_release(self, e):
         self.drag = None
+        if self.panning:
+            self.pan_end()
 
     def on_right(self, e):
         hit = self.nearest_pin(e.x, e.y)
@@ -1161,8 +1275,13 @@ class App:
                 self.log("OCR unavailable - install Tesseract, set its path")
                 return
             r = self.regions()
-            self.log(f"Read: wave={self.reader.number(r.get('wave'), True)}  "
-                     f"cash={self.reader.number(r.get('cash'))}")
+            w = self.reader.number(r.get("wave"), True)
+            wc = self.reader.last_conf
+            c = self.reader.number(r.get("cash"))
+            cc = self.reader.last_conf
+            self.log(f"Read: wave={w} ({wc:.0f}% sure)  "
+                     f"cash={c} ({cc:.0f}% sure)  - None = too unsure, "
+                     f"re-select the box if it's always None")
             if r.get("result"):
                 self.log("Result box text: " +
                          repr(self.reader.text(r["result"]).strip()[:80]))
